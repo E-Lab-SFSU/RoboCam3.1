@@ -22,3 +22,4 @@ config/calibrations/
 
 # PlayerOne SDK (proprietary, obtain from manufacturer)
 PlayerOne_Camera_SDK_Linux_V3.10.0/
+CLAUDE.md
