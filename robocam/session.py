@@ -27,6 +27,9 @@ DEFAULT_SESSION: Dict[str, Any] = {
         "loop_enabled": False,
         "loop_interval_s": 0.0,
         "loop_duration_s": 3600.0,
+        # {well_id: sub_label}, e.g. {"A1": "treated"} — set by right-clicking
+        # the well grid, folded into well labels at run time.
+        "sub_labels": {},
     },
     "calibration": {
         "cols": 12,

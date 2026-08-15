@@ -14,9 +14,19 @@ import numpy as np
 from datetime import datetime, timedelta
 from typing import List, Optional, Tuple
 from .config import get_config
+from .naming import sanitize_experiment_name, split_well_label
 from .peripherals import LaserController
 
 logger = logging.getLogger(__name__)
+
+# Title used when a run is started with a blank experiment name.
+_DEFAULT_EXPERIMENT_NAME = "experiment"
+
+# Run-level manifest, written at the top of every experiment directory. It's
+# the one file that ties a folder (and everything post-processing later
+# derives from it) back to the experiment title, settings, and well layout
+# it came from — see PROJECT_STATE.md § 4b.
+EXPERIMENT_MANIFEST_NAME = "experiment.json"
 
 # Bounded queue depth between the raw-burst capture (producer) thread and the
 # disk-write (consumer) thread. Sized as initial headroom for the NVMe M.2
@@ -924,6 +934,22 @@ class ExperimentRunner:
         return burst_meta, finalize_ctx
 
     # ------------------------------------------------------------------
+    # Run manifest
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _write_manifest(path: str, manifest: dict) -> None:
+        """
+        Write the run manifest, logging rather than raising on failure — a
+        bookkeeping file must never be the thing that kills a capture run
+        that is otherwise fine.
+        """
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(manifest, f, indent=2)
+        except OSError as e:
+            logger.warning(f"Could not write experiment manifest {path}: {e}")
+
+    # ------------------------------------------------------------------
     # Main experiment loop
     # ------------------------------------------------------------------
     def run(
@@ -967,12 +993,54 @@ class ExperimentRunner:
             callback(self.status_msg)
 
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        exp_dir = os.path.join(self.out_dir, f"{timestamp}_{name}")
+        # The raw title is kept for display/metadata; the sanitized form is
+        # what goes on disk, so a title with a space or slash in it can't
+        # produce a broken path (or a nested directory).
+        display_name = (name or "").strip() or _DEFAULT_EXPERIMENT_NAME
+        safe_name = sanitize_experiment_name(name)
+        exp_dir = os.path.join(self.out_dir, f"{timestamp}_{safe_name}")
         raw_dir = os.path.join(exp_dir, "raw")
         os.makedirs(raw_dir, exist_ok=True)
         self.last_exp_dir = exp_dir
 
-        csv_path = os.path.join(exp_dir, f"{timestamp}_{name}_points.csv")
+        csv_path = os.path.join(exp_dir, f"{timestamp}_{safe_name}_points.csv")
+        manifest_path = os.path.join(exp_dir, EXPERIMENT_MANIFEST_NAME)
+
+        # Written before the first well so an interrupted or crashed run
+        # still leaves an identifiable folder behind; rewritten at the end
+        # with the completion summary.
+        manifest = {
+            "experiment_name": display_name,
+            "experiment_name_safe": safe_name,
+            "timestamp": timestamp,
+            "started_at": datetime.now().isoformat(timespec="seconds"),
+            "finished_at": None,
+            "completed": False,
+            "mode": mode,
+            "image_format": image_format if mode != "raw" else None,
+            "delay_per_well_s": float(delay_per_well),
+            "use_laser": bool(use_laser),
+            "pre_duration_s": float(pre_duration),
+            "laser_on_duration_s": float(laser_on_duration) if use_laser else 0.0,
+            "post_duration_s": float(post_duration) if use_laser else 0.0,
+            "well_count": len(labels),
+            "wells": [
+                {
+                    "label": lab,
+                    "well": split_well_label(lab)[0],
+                    "sub_label": split_well_label(lab)[1],
+                    "x": p[0], "y": p[1], "z": p[2],
+                }
+                for lab, p in zip(labels, positions)
+            ],
+        }
+        self._write_manifest(manifest_path, manifest)
+
+        # Set only on the success path below. Inferring completion from
+        # self.running in the finally: doesn't work — it's still True when
+        # run() unwinds on an exception, which would mark a crashed run
+        # "completed".
+        completed_ok = False
 
         # Pre-calculate total duration for raw mode
         if use_laser:
@@ -1011,6 +1079,11 @@ class ExperimentRunner:
             # post-processing pipeline knows how to debayer the .npy frames.
             if mode == "raw":
                 cam_meta = self.camera.get_camera_meta()
+                # Stamp the title here too: camera_meta.json travels with the
+                # raw/ directory, so a raw folder lifted out of its parent
+                # still knows which experiment produced it.
+                cam_meta["experiment_name"] = display_name
+                cam_meta["experiment_timestamp"] = timestamp
                 with open(os.path.join(raw_dir, "camera_meta.json"), "w", encoding="utf-8") as mf:
                     json.dump(cam_meta, mf, indent=2)
 
@@ -1165,7 +1238,11 @@ class ExperimentRunner:
                         )
                         capture_name = f"raw/{burst_meta['frames_file']} ({burst_meta['frames_captured']} frames)"
                         meta_path = os.path.join(raw_dir, f"{label}_{timestamp}_metadata.json")
+                        well_base, well_sub = split_well_label(label)
                         burst_meta["well"] = label
+                        burst_meta["well_base"] = well_base
+                        burst_meta["sub_label"] = well_sub
+                        burst_meta["experiment_name"] = display_name
                         burst_meta["timestamp"] = capture_time
                         with open(meta_path, "w", encoding="utf-8") as mf:
                             json.dump(burst_meta, mf, indent=2)
@@ -1208,7 +1285,11 @@ class ExperimentRunner:
                     else:
                         # Standard still image
                         fmt = (image_format or "png").lower().lstrip(".")
-                        capture_name = f"{label}_{timestamp}.{fmt}"
+                        # Prefixed with the experiment name: a still is a
+                        # finished deliverable that gets dragged out of its
+                        # folder, and the folder is the only other place the
+                        # title is recorded.
+                        capture_name = f"{safe_name}_{label}_{timestamp}.{fmt}"
                         img_path = os.path.join(exp_dir, capture_name)
                         frame = self.camera.get_frame()
                         if frame is not None:
@@ -1229,6 +1310,10 @@ class ExperimentRunner:
                     f.flush()
 
             if self.running:
+                # This cycle's own output folder is complete, whether or not
+                # more loop passes follow — each run() call writes its own
+                # manifest, so completion is per-cycle here too.
+                completed_ok = True
                 # Mid-loop, this run() call is just one cycle -- "Experiment
                 # finished" would wrongly read as the whole loop being done
                 # while it's actually just waiting out the interval (or
@@ -1266,6 +1351,16 @@ class ExperimentRunner:
                 pending_finalize.join()
             if "laser_controller" in locals() and laser_controller:
                 laser_controller.disconnect()
+
+            # Close out the manifest here rather than on the success path, so
+            # a run that errored or was stopped still records when it ended
+            # and how far it got — "completed": false with a real
+            # finished_at is the useful signal for a partial folder.
+            manifest["wells_captured"] = wells_captured if "wells_captured" in locals() else 0
+            manifest["finished_at"] = datetime.now().isoformat(timespec="seconds")
+            manifest["completed"] = completed_ok
+            self._write_manifest(manifest_path, manifest)
+
             self.running = False
             self.current_well = ""
             self.is_raw_mode = False

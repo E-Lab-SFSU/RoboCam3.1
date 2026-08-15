@@ -14,6 +14,7 @@ from robocam.loop_postprocess import (
     build_loop_video,
     discover_valid_cycles,
     find_loop_wells,
+    well_from_still_name,
     well_is_raw_mode,
 )
 from tests.test_experiment import _FakeCamera, _FakeMotion, _make_runner
@@ -112,6 +113,36 @@ class TestWellIsRawMode:
         assert well_is_raw_mode(tmp_path, "A1") is False
 
 
+class TestWellFromStillName:
+    """
+    Loop artifacts locate a cycle's still by well. The experiment title was
+    added as a filename prefix on 2026-08-14, so the well is no longer the
+    first underscore token — both layouts have to keep working, since a
+    loop folder can predate the change.
+    """
+
+    def test_legacy_unprefixed_name(self):
+        assert well_from_still_name("A1_20260814_101500.png") == "A1"
+
+    def test_current_prefixed_name(self):
+        assert well_from_still_name("myexp_A1_20260814_101500.png") == "A1"
+
+    def test_experiment_name_containing_underscores(self):
+        assert well_from_still_name("my_long_exp_B12_20260814_101500.tif") == "B12"
+
+    def test_sub_labelled_well(self):
+        assert well_from_still_name("myexp_A1-treated_20260814_101500.png") == "A1-treated"
+
+    def test_name_containing_a_datelike_token_scans_from_the_right(self):
+        assert well_from_still_name("run_20250101_A3_20260814_101500.png") == "A3"
+
+    @pytest.mark.parametrize("name", [
+        "notawell.png", "A1.png", "A1_notadate_101500.png", "20260814_101500.png",
+    ])
+    def test_unparseable_returns_none(self, name):
+        assert well_from_still_name(name) is None
+
+
 def _make_real_loop(tmp_path, mode, camera=None):
     runner = _make_runner(tmp_path, camera=camera)
     runner.run_loop(
@@ -177,7 +208,13 @@ class TestBuildLoopStillsZip:
             names = zf.namelist()
         assert len(names) == len(cycles)  # 1 well x N cycles
         for cycle in cycles:
-            assert any(n.startswith(f"{cycle['dir'].name}/A1_") for n in names)
+            # Stills are named <experiment>_<well>_<ts>.<ext>, so match on the
+            # parsed well rather than a filename prefix.
+            assert any(
+                n.startswith(f"{cycle['dir'].name}/")
+                and well_from_still_name(n) == "A1"
+                for n in names
+            )
 
     def test_filters_to_requested_wells(self, tmp_path):
         loop_dir = _make_real_loop(tmp_path, mode="image")

@@ -52,6 +52,7 @@ class _ProcessWorker(QThread):
     def run(self):
         from robocam.postprocess import (
             find_metadata_files, parse_meta_name, process_well, open_export_zip,
+            resolve_experiment_name,
         )
 
         # Gather all wells across all selected folders, grouped by experiment
@@ -73,6 +74,11 @@ class _ProcessWorker(QThread):
         for exp_dir, metas in jobs_by_exp.items():
             if self._stop:
                 break
+
+            # Resolved once per experiment rather than per well — every well
+            # in a folder shares one title.
+            exp_name = resolve_experiment_name(exp_dir)
+            self.log_line.emit(f"\n=== {exp_dir.name}  —  title: {exp_name or '(none)'}")
 
             zip_png  = (open_export_zip(exp_dir, "png")
                         if self._do_png and self._zip_images else None)
@@ -103,6 +109,7 @@ class _ProcessWorker(QThread):
                             zip_png=zip_png,
                             zip_jpeg=zip_jpeg,
                             progress_callback=_frame_cb,
+                            exp_name=exp_name,
                         )
                         self.well_done.emit(well, True, "")
                         ok += 1

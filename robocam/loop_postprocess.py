@@ -87,12 +87,39 @@ def well_is_raw_mode(cycle_dir: Path, well: str) -> bool:
     return bool(list((cycle_dir / "raw").glob(f"{well}_*_metadata.json")))
 
 
+_STILL_SUFFIXES = (".png", ".jpg", ".jpeg", ".tif", ".tiff")
+
+
+def well_from_still_name(filename: str) -> Optional[str]:
+    """
+    Recover the well label from an image-mode still filename.
+
+    Handles both layouts ExperimentRunner has written:
+
+        <well>_<YYYYmmdd>_<HHMMSS>.<ext>                (pre-2026-08-14)
+        <experiment>_<well>_<YYYYmmdd>_<HHMMSS>.<ext>   (current)
+
+    The well is located as the token immediately before the date/time pair
+    rather than by position, because the experiment name may itself contain
+    underscores. Scans from the right so a name containing a date-like token
+    can't win over the real timestamp. Returns None if the filename matches
+    neither layout.
+    """
+    parts = Path(filename).stem.split("_")
+    for j in range(len(parts) - 2, 0, -1):
+        if (len(parts[j]) == 8 and parts[j].isdigit()
+                and len(parts[j + 1]) == 6 and parts[j + 1].isdigit()):
+            return parts[j - 1]
+    return None
+
+
 def _well_still_path(cycle_dir: Path, well: str) -> Optional[Path]:
     """The one loose still-image file image mode writes directly into the
     cycle folder for this well, if present."""
     matches = [
-        p for p in cycle_dir.glob(f"{well}_*")
-        if p.is_file() and p.suffix.lower() in (".png", ".jpg", ".jpeg", ".tif", ".tiff")
+        p for p in sorted(cycle_dir.iterdir())
+        if p.is_file() and p.suffix.lower() in _STILL_SUFFIXES
+        and well_from_still_name(p.name) == well
     ]
     return matches[0] if matches else None
 
@@ -225,10 +252,9 @@ def build_loop_stills_zip(cycles: list[dict], out_zip_path: str, wells: Optional
         for cycle in cycles:
             cycle_dir = cycle["dir"]
             for path in sorted(cycle_dir.iterdir()):
-                if not path.is_file() or path.suffix.lower() not in (".png", ".jpg", ".jpeg", ".tif", ".tiff"):
+                if not path.is_file() or path.suffix.lower() not in _STILL_SUFFIXES:
                     continue
-                well = path.name.split("_", 1)[0]
-                if wells_set is not None and well not in wells_set:
+                if wells_set is not None and well_from_still_name(path.name) not in wells_set:
                     continue
                 zf.write(path, arcname=f"{cycle_dir.name}/{path.name}")
     return out_path
