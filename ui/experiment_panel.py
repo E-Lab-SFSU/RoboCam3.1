@@ -597,6 +597,29 @@ class ExperimentPanel(QWidget):
         self.loop_duration_row.setVisible(enabled)
         self.loop_cycle_count_lbl.setVisible(enabled)
 
+    def _resolve_selected_wells(self, positions, labels):
+        """
+        Intersect the grid's selection with a calibration, returning
+        ``(filtered_positions, filtered_labels)`` with any sub-labels folded
+        into the labels.
+
+        Matches by *well id*, never by positional index. The calibration
+        stores wells in travel order and ``PATTERN_SNAKE`` reverses every
+        other row, so indexing it with the grid's row-major indices
+        addressed the mirrored well on odd rows. Iterating the calibration
+        in its own order also keeps the travel-path optimisation intact —
+        which matters for the loop pass-estimate as well as the run itself.
+        """
+        selected_wells = self.well_grid.get_selected_labels()
+        sub_labels = self.well_grid.get_sub_labels()
+        filtered_pos, filtered_labels = [], []
+        for i, well in enumerate(labels):
+            if well not in selected_wells or i >= len(positions):
+                continue
+            filtered_pos.append(positions[i])
+            filtered_labels.append(compose_well_label(well, sub_labels.get(well)))
+        return filtered_pos, filtered_labels
+
     def _update_sel_count(self):
         sel = self.well_grid.selected_count()
         tot = self.well_grid.total_count()
@@ -949,19 +972,7 @@ class ExperimentPanel(QWidget):
             QMessageBox.critical(self, "Error", "No wells selected.")
             return
 
-        # Match the grid's selection to the calibration by *well id*, not by
-        # positional index.  The calibration stores wells in travel order,
-        # which for PATTERN_SNAKE reverses every other row — indexing into it
-        # with the grid's row-major indices addressed the mirrored well on
-        # odd rows.  Iterating the calibration in its own order also keeps
-        # the travel-path optimisation intact.
-        sub_labels = self.well_grid.get_sub_labels()
-        filtered_pos, filtered_labels = [], []
-        for i, well in enumerate(labels):
-            if well not in selected_wells or i >= len(positions):
-                continue
-            filtered_pos.append(positions[i])
-            filtered_labels.append(compose_well_label(well, sub_labels.get(well)))
+        filtered_pos, filtered_labels = self._resolve_selected_wells(positions, labels)
 
         if not filtered_pos:
             msg = ("None of the selected wells exist in the calibration.\n"
@@ -1163,8 +1174,7 @@ class ExperimentPanel(QWidget):
             self.loop_cycle_count_lbl.setText("")
             return
 
-        selected = self.well_grid.get_selected_indices()
-        filtered_pos = [positions[i] for i in selected if i < len(positions)]
+        filtered_pos, _ = self._resolve_selected_wells(positions, labels)
         if not filtered_pos:
             self.pass_estimate_lbl.setText("")
             self.loop_cycle_count_lbl.setText("")
