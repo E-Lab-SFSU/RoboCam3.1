@@ -31,18 +31,27 @@ Real-time encoded video (the former `Video (AVI)` mode) has been removed. Post-p
 **Output folder layout (actual, as written by `ExperimentRunner`):**
 ```
 <exp_dir>/
+  experiment.json                    ← run manifest: experiment_name, sanitized name, timestamp, mode,
+                                        all timing/laser settings, wells[] (label, well, sub_label, xyz),
+                                        started_at/finished_at/completed/wells_captured
   raw/
     camera_meta.json                 ← written once per experiment: backend, model, bit depth, resolution,
                                         gain, exposure, fps, hqi_enabled, usb_bandwidth_limit, offset,
-                                        sensor_mode_index, sensor_mode_name
+                                        sensor_mode_index, sensor_mode_name, experiment_name
     <well>_<ts>_stack.npy            ← one memory-mapped (n_frames, H, W) array for the whole well
     <well>_<ts>_frames.jsonl         ← one JSON line per frame, appended as captured (crash-resilient;
                                         not read by postprocess.py — a recovery artifact only)
     <well>_<ts>_metadata.json        ← frames_file, frames[] (frame_index, time_offset_s), laser_events[],
                                         fps_average, duration_actual_s, capture_failures,
-                                        sdk_dropped_frames, queue_full_stalls, queue_full_stall_s_total
+                                        sdk_dropped_frames, queue_full_stalls, queue_full_stall_s_total,
+                                        experiment_name, well/well_base/sub_label
   <ts>_<name>_points.csv
 ```
+
+`<well>` carries any sub-label set from the Experiment tab's well grid, e.g.
+`A1-treated_<ts>_stack.npy`. The separator is `-` and never `_`, because
+`postprocess.parse_meta_name()` splits these filenames on the underscore to
+recover the well and timestamp — see `robocam/naming.py`.
 
 Pre-2026-07-06 captures (e.g. the 2026-07-01 test dataset) used one `.npy` file per frame instead — `postprocess.py` still reads that format too (no `frames_file` key present is how it tells the two apart), so older data doesn't need migrating.
 

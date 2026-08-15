@@ -49,7 +49,10 @@ _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
-from robocam.postprocess import find_metadata_files, parse_meta_name, process_well, open_export_zip
+from robocam.postprocess import (
+    find_metadata_files, parse_meta_name, process_well, open_export_zip,
+    resolve_experiment_name,
+)
 
 
 def main() -> None:
@@ -78,6 +81,10 @@ def main() -> None:
     ap.add_argument("--zip", action="store_true",
         help="Package each selected image format into one .zip per experiment "
              "(all wells) instead of loose files — easier to transfer.")
+    ap.add_argument("--name", default=None,
+        help="Experiment title to stamp into video filenames, container tags "
+             "and image sidecars. Defaults to the title recorded by the run "
+             "(experiment.json / metadata), falling back to the folder name.")
     args = ap.parse_args()
 
     # Pick exactly what's named on the command line; if nothing was named,
@@ -95,7 +102,10 @@ def main() -> None:
     except ValueError as e:
         sys.exit(str(e))
 
+    exp_name = args.name if args.name is not None else resolve_experiment_name(exp_dir)
+
     print(f"Experiment : {exp_dir.name}")
+    print(f"Title      : {exp_name or '(none)'}")
     print(f"Wells      : {len(meta_files)}")
 
     zip_png  = open_export_zip(exp_dir, "png")  if do_png  and zip_images else None
@@ -118,6 +128,7 @@ def main() -> None:
                     jpeg_quality=args.jpeg_quality,
                     zip_png=zip_png,
                     zip_jpeg=zip_jpeg,
+                    exp_name=exp_name,
                 )
             except Exception as e:
                 print(f"  ERROR: {e}", file=sys.stderr)

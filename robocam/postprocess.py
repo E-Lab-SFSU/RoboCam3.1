@@ -20,6 +20,8 @@ from typing import Callable, Optional
 import cv2
 import numpy as np
 
+from .naming import sanitize_experiment_name, split_well_label
+
 try:
     import av
     AV_AVAILABLE = True
@@ -119,11 +121,79 @@ def find_metadata_files(path: str) -> tuple[list[Path], Path]:
 
 
 def parse_meta_name(meta_path: Path) -> tuple[str, str]:
-    """Return (well, exp_timestamp) from a metadata filename like A1_20260625_133324_metadata.json."""
+    """
+    Return (well, exp_timestamp) from a metadata filename like
+    A1_20260625_133324_metadata.json.
+
+    ``well`` may carry a sub-label (``A1-treated``); sub-labels use ``-``
+    precisely so this underscore split keeps working — see
+    ``robocam/naming.py``.
+    """
     parts = meta_path.stem.split("_")
     well   = parts[0]
     exp_ts = f"{parts[1]}_{parts[2]}" if len(parts) >= 3 else "unknown"
     return well, exp_ts
+
+
+def resolve_experiment_name(exp_dir: Path, meta: Optional[dict] = None,
+                            camera_meta: Optional[dict] = None) -> str:
+    """
+    Recover the experiment title for a capture folder.
+
+    Tries, in order of trustworthiness:
+
+    1. The run manifest ``experiment.json`` written by ExperimentRunner.
+    2. ``experiment_name`` stamped into the well's own metadata, or into
+       ``camera_meta.json`` (both survive a raw/ directory being moved).
+    3. The directory name, stripping the leading ``YYYYmmdd_HHMMSS_``.
+
+    Step 3 is what makes this work on data captured before any of this
+    existed, so old folders still get a sensible title rather than none.
+    Returns "" only when even the directory name yields nothing.
+    """
+    manifest = exp_dir / "experiment.json"
+    if manifest.is_file():
+        try:
+            with open(manifest, encoding="utf-8") as f:
+                name = (json.load(f).get("experiment_name") or "").strip()
+            if name:
+                return name
+        except (json.JSONDecodeError, OSError):
+            pass
+
+    for src in (meta, camera_meta):
+        if src:
+            name = (src.get("experiment_name") or "").strip()
+            if name:
+                return name
+
+    # Legacy fallback: "<ts>_<name>" → "<name>".
+    stem = exp_dir.name
+    parts = stem.split("_", 2)
+    if len(parts) == 3 and len(parts[0]) == 8 and parts[0].isdigit() and parts[1].isdigit():
+        return parts[2]
+    return stem
+
+
+def _write_image_sidecar(dest_dir: Path, payload: dict,
+                         zip_target: Optional[zipfile.ZipFile] = None,
+                         zip_prefix: str = "") -> None:
+    """
+    Drop a ``_source.json`` next to an image sequence.
+
+    PNG/JPEG here go through ``cv2.imwrite``/``imencode``, which cannot
+    write EXIF or PNG tEXt chunks, so a sidecar is the only way an image
+    folder carries its own provenance.
+    """
+    blob = json.dumps(payload, indent=2)
+    try:
+        if zip_target is not None:
+            zip_target.writestr(f"{zip_prefix}_source.json", blob)
+        else:
+            dest_dir.mkdir(parents=True, exist_ok=True)
+            (dest_dir / "_source.json").write_text(blob, encoding="utf-8")
+    except (OSError, ValueError) as e:
+        print(f"  [warn] could not write _source.json: {e}")
 
 
 def open_export_zip(exp_dir: Path, fmt: str) -> zipfile.ZipFile:
@@ -155,6 +225,7 @@ def process_well(
     zip_png: Optional[zipfile.ZipFile] = None,
     zip_jpeg: Optional[zipfile.ZipFile] = None,
     progress_callback: Optional[Callable[[int, int], None]] = None,
+    exp_name: Optional[str] = None,
 ) -> None:
     """
     Process one well: .npy burst → PNG and/or JPEG image sequence, and/or
@@ -170,6 +241,12 @@ def process_well(
 
     progress_callback(current_frame, total_frames) is called periodically
     during the frame loop.
+
+    exp_name: the experiment title. It prefixes the video filenames and is
+    written into the video container tags and the image-sequence sidecar, so
+    a file that gets moved out of its folder still names its source. Left as
+    None it is recovered from the run manifest / metadata / directory name
+    via resolve_experiment_name().
     """
     if (do_mp4 or do_vfr) and not AV_AVAILABLE:
         raise RuntimeError("PyAV not installed — cannot encode video. "
@@ -198,6 +275,12 @@ def process_well(
     well, exp_ts = parse_meta_name(meta_path)
     duration     = meta.get("duration_actual_s", 0)
     fps_avg      = meta.get("fps_average", meta.get("fps_actual", 0))
+
+    if exp_name is None:
+        exp_name = resolve_experiment_name(exp_dir, meta, camera_meta)
+    safe_exp_name = sanitize_experiment_name(exp_name, fallback="")
+    name_prefix = f"{safe_exp_name}_" if safe_exp_name else ""
+    well_base, well_sub = split_well_label(well)
 
     # Mono sensors (e.g. PlayerOne Mars 662M) have no real color data.
     # Encoding the display MP4 as true single-channel (pix_fmt "gray") was
@@ -249,8 +332,26 @@ def process_well(
     if do_vfr:
         vfr_dir.mkdir(parents=True, exist_ok=True)
 
-    mkv_path = str(vfr_dir / f"{well}_{exp_ts}_vfr.mkv")
-    mp4_path = str(mp4_dir / f"{well}_{exp_ts}.mp4")
+    mkv_path = str(vfr_dir / f"{name_prefix}{well}_{exp_ts}_vfr.mkv")
+    mp4_path = str(mp4_dir / f"{name_prefix}{well}_{exp_ts}.mp4")
+
+    # Tags written into both containers. The filename prefix above covers
+    # the glance-at-the-folder case; these cover the file being renamed.
+    _pretty_ts = (f"{exp_ts[:4]}-{exp_ts[4:6]}-{exp_ts[6:8]} "
+                  f"{exp_ts[9:11]}:{exp_ts[11:13]}"
+                  if len(exp_ts) == 15 and exp_ts[:8].isdigit() else exp_ts)
+    _well_desc = f"well {well_base}" + (f" [{well_sub}]" if well_sub else "")
+    container_tags = {
+        "title": exp_name or well,
+        "comment": " | ".join(filter(None, [
+            exp_name, _well_desc, _pretty_ts,
+            f"{n} frames", f"{duration:.3f}s", f"{fps_avg:.2f} fps avg",
+        ])),
+        "album": exp_name or "",
+        "track": well,
+        "date": exp_ts[:8] if exp_ts[:8].isdigit() else "",
+    }
+    container_tags = {k: v for k, v in container_tags.items() if v}
 
     display_fps = (Fraction(n, 1) / Fraction(round(duration * 1000), 1000)
                    if duration > 0 else Fraction(30))
@@ -258,6 +359,9 @@ def process_well(
     mkv_con = mkv_s = mp4_con = mp4_s = None
     if do_vfr:
         mkv_con        = av.open(mkv_path, "w")
+        # Must be set before the first mux() — the muxer writes the header
+        # (and with it the tags) when encoding starts.
+        mkv_con.metadata.update(container_tags)
         # `rate=` here must be the real average fps (metadata only — it's what
         # players/tools read as avg_frame_rate). Passing the 90kHz PTS clock
         # here instead (as this used to) makes add_stream() advertise a
@@ -276,15 +380,36 @@ def process_well(
         mkv_s.time_base = _TIME_BASE
         if codec in ("libx264", "libx265"):
             mkv_s.options = {"crf": str(crf), "preset": "medium", "bframes": "0"}
+        # Matroska keeps a per-track name; use it for the well so a
+        # multi-track view still identifies the source well.
+        mkv_s.metadata["title"] = well
 
     if do_mp4:
         mp4_con        = av.open(mp4_path, "w")
+        mp4_con.metadata.update(container_tags)
         mp4_s          = mp4_con.add_stream("libx264", rate=display_fps)
         mp4_s.width    = w
         mp4_s.height   = h
         mp4_s.pix_fmt  = "yuv420p"
         mp4_s.options  = {"crf": str(crf), "preset": "medium",
                           "profile": "baseline", "bframes": "0"}
+
+    if do_png or do_jpeg:
+        sidecar = {
+            "experiment_name": exp_name,
+            "experiment_timestamp": exp_ts,
+            "well": well,
+            "well_base": well_base,
+            "sub_label": well_sub,
+            "frames": n,
+            "duration_s": duration,
+            "fps_average": fps_avg,
+            "source_metadata": meta_path.name,
+        }
+        if do_png:
+            _write_image_sidecar(img_png_dir, sidecar, zip_png, f"{well}/")
+        if do_jpeg:
+            _write_image_sidecar(img_jpeg_dir, sidecar, zip_jpeg, f"{well}/")
 
     try:
         for i, fi in enumerate(frames_info):

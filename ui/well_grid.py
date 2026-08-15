@@ -25,6 +25,18 @@ WellGrid.Mode.SELECT
     Click-and-drag paints all cells the cursor passes over to the target
     state determined by the first cell touched in the stroke.
     Emits ``selection_changed`` whenever the selection changes.
+
+Sub-labels
+----------
+In SELECT mode, right-clicking opens a context menu for attaching a free-text
+sub-label ("treated", "ctrl", ...) to a well or to the whole current
+selection.  The sub-label is drawn under the well id, tinted with a colour
+derived from the label text so identical labels are visually grouped and a
+mis-assignment is obvious at a glance.
+
+Sub-labels are display + bookkeeping state only; the Experiment panel reads
+them via ``get_sub_labels()`` and folds them into the well labels it hands
+the runner, which is what puts them into capture filenames and metadata.
 """
 from __future__ import annotations
 
@@ -35,7 +47,9 @@ from PySide6.QtCore import Qt, Signal, QRect, QPoint, QSize
 from PySide6.QtGui import (
     QPainter, QColor, QFont, QFontMetrics, QPen, QMouseEvent,
 )
-from PySide6.QtWidgets import QWidget, QSizePolicy
+from PySide6.QtWidgets import QWidget, QSizePolicy, QMenu, QInputDialog
+
+from robocam.naming import row_label, sanitize_sub_label
 
 
 # ---------------------------------------------------------------------------
@@ -53,6 +67,33 @@ _COL_TEXT_DESEL = QColor("#aaaaaa")
 _COL_BORDER_SEL = QColor("#1a5ab2")
 _COL_BORDER_DESEL = QColor("#333333")
 _COL_BG         = QColor("#f0f0f0")   # widget background
+
+# Accent colours for sub-labels.  Picked to stay legible against both the
+# selected (blue) and deselected (grey) cell backgrounds, and to be
+# distinguishable from each other — the point is to spot at a glance that
+# one well in a "treated" block was accidentally left "ctrl".
+_SUB_LABEL_COLORS = [
+    QColor("#ffd166"),   # amber
+    QColor("#8ce99a"),   # green
+    QColor("#ffa8a8"),   # salmon
+    QColor("#b197fc"),   # violet
+    QColor("#66d9e8"),   # cyan
+    QColor("#ffc9de"),   # pink
+    QColor("#d8f5a2"),   # lime
+    QColor("#ffb37a"),   # orange
+]
+
+
+def sub_label_color(label: str) -> QColor:
+    """
+    Stable colour for a sub-label.  Uses a hand-rolled hash rather than
+    ``hash()`` because Python salts string hashing per process, which would
+    make a well change colour between app launches.
+    """
+    acc = 0
+    for ch in label:
+        acc = (acc * 131 + ord(ch)) & 0xFFFFFFFF
+    return _SUB_LABEL_COLORS[acc % len(_SUB_LABEL_COLORS)]
 
 
 # ---------------------------------------------------------------------------
@@ -82,6 +123,7 @@ class WellGrid(QWidget):
     # Signals
     well_clicked       = Signal(int, int)   # (row, col) — NAVIGATE mode
     selection_changed  = Signal()           # SELECT mode
+    sub_labels_changed = Signal()           # SELECT mode
 
     def __init__(
         self,
@@ -105,6 +147,13 @@ class WellGrid(QWidget):
         self._selected: list[list[bool]] = [
             [True] * cols for _ in range(rows)
         ]
+        # Sub-labels keyed by well id ("A1"), not by (row, col).  Well ids
+        # survive a rebuild(), so a label set while the grid is still at its
+        # construction-time size isn't lost when a larger calibration later
+        # resizes the grid — which is exactly the order the Experiment panel
+        # does it in (session restore runs before calibration sync).
+        # Absent key == no label; empty strings are never stored.
+        self._sub_labels: dict[str, str] = {}
         self._drag_target: Optional[bool] = None
         self._hover_cell: Optional[tuple[int, int]] = None
 
@@ -142,6 +191,10 @@ class WellGrid(QWidget):
                 else:
                     row_data.append(True)
             self._selected.append(row_data)
+        # Sub-labels are deliberately *not* pruned here — they're keyed by
+        # well id, so a label on a well outside the new dimensions lies
+        # dormant and comes back if the plate grows again.  Wells absent
+        # from the active calibration are skipped at run time anyway.
         self._drag_target = None
         self._hover_cell = None
         self.setMinimumSize(self.sizeHint())
@@ -169,16 +222,72 @@ class WellGrid(QWidget):
         self.selection_changed.emit()
         self.update()
 
-    def get_selected_indices(self) -> list[int]:
-        """Return flat indices of selected wells in row-major order."""
-        indices = []
-        idx = 0
-        for r in range(self._rows):
-            for c in range(self._cols):
-                if self._selected[r][c]:
-                    indices.append(idx)
-                idx += 1
-        return indices
+    # NOTE: there is deliberately no get_selected_indices() returning flat
+    # row-major indices.  It existed until 2026-08-14 and was a trap: a
+    # calibration stores wells in *travel* order, and PATTERN_SNAKE reverses
+    # odd rows, so row-major indices addressed the mirrored well on every
+    # other row.  Match by well id via get_selected_labels() instead.
+
+    def well_label(self, row: int, col: int) -> str:
+        """Well id for a cell, e.g. ``(0, 0)`` → ``"A1"``."""
+        return f"{row_label(row)}{col + 1}"
+
+    def get_selected_labels(self) -> set[str]:
+        """
+        Well ids of every selected cell.
+
+        Callers match these against the calibration's own ``labels`` list
+        rather than indexing into it positionally, which keeps the mapping
+        correct regardless of whether the plate was calibrated in raster or
+        snake order.
+        """
+        return {
+            self.well_label(r, c)
+            for r in range(self._rows)
+            for c in range(self._cols)
+            if self._selected[r][c]
+        }
+
+    def get_sub_labels(self) -> dict[str, str]:
+        """
+        All sub-labels keyed by well id, e.g. ``{"A1": "treated"}``.
+
+        Includes labels for wells outside the current grid dimensions so
+        that saving and reloading a layout is lossless — see
+        :meth:`rebuild`.
+        """
+        return dict(self._sub_labels)
+
+    def set_sub_labels(self, mapping: dict) -> None:
+        """
+        Replace all sub-labels from a ``{well_id: label}`` mapping (the form
+        stored in presets/session).  Values are sanitised on the way in, so
+        a hand-edited preset can't smuggle an underscore into a well label.
+        """
+        cleaned: dict[str, str] = {}
+        for well, raw in (mapping or {}).items():
+            clean = sanitize_sub_label(str(raw))
+            if clean:
+                cleaned[str(well)] = clean
+        self._sub_labels = cleaned
+        self.sub_labels_changed.emit()
+        self.update()
+
+    def clear_sub_labels(self) -> None:
+        if not self._sub_labels:
+            return
+        self._sub_labels = {}
+        self.sub_labels_changed.emit()
+        self.update()
+
+    def sub_labelled_count(self) -> int:
+        """Number of *visible* labelled wells (dormant ones aren't counted)."""
+        return sum(
+            1
+            for r in range(self._rows)
+            for c in range(self._cols)
+            if self._sub_labels.get(self.well_label(r, c))
+        )
 
     def selected_count(self) -> int:
         return sum(self._selected[r][c] for r in range(self._rows) for c in range(self._cols))
@@ -216,13 +325,18 @@ class WellGrid(QWidget):
 
         font = QFont()
         font.setPixelSize(9)
+        sub_font = QFont()
+        sub_font.setPixelSize(8)
+        sub_font.setBold(True)
+        sub_metrics = QFontMetrics(sub_font)
         painter.setFont(font)
 
         for r in range(self._rows):
             for c in range(self._cols):
                 rect = self._cell_rect(r, c)
                 is_hover = (self._hover_cell == (r, c))
-                label = f"{chr(ord('A') + r)}{c + 1}"
+                label = self.well_label(r, c)
+                sub = self._sub_labels.get(label, "")
 
                 if self._mode == WellGrid.Mode.SELECT:
                     sel = self._selected[r][c]
@@ -244,14 +358,35 @@ class WellGrid(QWidget):
                 painter.setBrush(bg)
                 painter.drawRoundedRect(rect, 3, 3)
 
-                # Border
-                painter.setPen(QPen(border, 1))
+                # Border — a sub-labelled cell borrows its label's accent
+                # colour so grouped wells read as a block.
+                accent = sub_label_color(sub) if sub else None
+                painter.setPen(QPen(accent if accent else border, 2 if accent else 1))
                 painter.setBrush(Qt.BrushStyle.NoBrush)
                 painter.drawRoundedRect(rect, 3, 3)
 
-                # Label
-                painter.setPen(fg)
-                painter.drawText(rect, Qt.AlignmentFlag.AlignCenter, label)
+                if sub:
+                    # Two-line cell: well id on top, sub-label beneath.
+                    # Split the box rather than overlaying so neither
+                    # clips the other on a small cell.
+                    top = QRect(rect.x(), rect.y(), rect.width(), rect.height() // 2)
+                    bottom = QRect(rect.x(), rect.y() + rect.height() // 2,
+                                   rect.width(), rect.height() - rect.height() // 2)
+
+                    painter.setFont(font)
+                    painter.setPen(fg)
+                    painter.drawText(top, Qt.AlignmentFlag.AlignCenter, label)
+
+                    painter.setFont(sub_font)
+                    painter.setPen(accent)
+                    shown = sub_metrics.elidedText(
+                        sub, Qt.TextElideMode.ElideRight, bottom.width() - 2
+                    )
+                    painter.drawText(bottom, Qt.AlignmentFlag.AlignCenter, shown)
+                    painter.setFont(font)
+                else:
+                    painter.setPen(fg)
+                    painter.drawText(rect, Qt.AlignmentFlag.AlignCenter, label)
 
         painter.end()
 
@@ -304,3 +439,76 @@ class WellGrid(QWidget):
     def leaveEvent(self, event):
         self._hover_cell = None
         self.update()
+
+    # ------------------------------------------------------------------
+    # Sub-label context menu
+    # ------------------------------------------------------------------
+
+    def contextMenuEvent(self, event):
+        """
+        Right-click menu for attaching sub-labels (SELECT mode only).
+
+        Acts on the whole selection when the right-clicked well is part of
+        it — labelling a block is the common case — and on the single well
+        otherwise, so right-clicking outside the selection can't silently
+        relabel wells the user wasn't pointing at.
+        """
+        if self._mode != WellGrid.Mode.SELECT:
+            return
+
+        cell = self._cell_at(event.pos())
+        if cell is None:
+            return
+        r, c = cell
+        clicked = self.well_label(r, c)
+
+        selected = sorted(self.get_selected_labels())
+        clicked_in_selection = clicked in selected
+        targets = selected if clicked_in_selection else [clicked]
+        scope = (
+            f"{len(targets)} selected wells"
+            if clicked_in_selection and len(targets) > 1
+            else clicked
+        )
+
+        menu = QMenu(self)
+        set_act = menu.addAction(f"Set label for {scope}…")
+        clear_act = menu.addAction(f"Clear label on {scope}")
+        clear_act.setEnabled(any(t in self._sub_labels for t in targets))
+        menu.addSeparator()
+        clear_all_act = menu.addAction("Clear all labels")
+        clear_all_act.setEnabled(bool(self._sub_labels))
+
+        chosen = menu.exec(event.globalPos())
+        if chosen is None:
+            return
+
+        if chosen is clear_all_act:
+            self.clear_sub_labels()
+            return
+
+        if chosen is clear_act:
+            for t in targets:
+                self._sub_labels.pop(t, None)
+            self.sub_labels_changed.emit()
+            self.update()
+            return
+
+        if chosen is set_act:
+            current = self._sub_labels.get(clicked, "")
+            text, ok = QInputDialog.getText(
+                self, "Well Sub-Label",
+                f"Sub-label for {scope}:\n"
+                "(letters and digits; other characters become '-')",
+                text=current,
+            )
+            if not ok:
+                return
+            clean = sanitize_sub_label(text)
+            for t in targets:
+                if clean:
+                    self._sub_labels[t] = clean
+                else:
+                    self._sub_labels.pop(t, None)
+            self.sub_labels_changed.emit()
+            self.update()

@@ -32,6 +32,7 @@ from PySide6.QtWidgets import (
 from robocam.calibration import WellPlate
 from robocam.config import get_config
 from robocam.experiment import estimate_loop_cycle_count
+from robocam.naming import compose_well_label
 import robocam.hw_state as hw_state
 from robocam.session import session_manager
 from ui.camera_widget import _FrameGrabber, _LivePreview
@@ -508,7 +509,7 @@ class ExperimentPanel(QWidget):
         return grp
 
     def _build_well_selection_group(self) -> QGroupBox:
-        grp = QGroupBox("Well Selection  (drag to toggle)")
+        grp = QGroupBox("Well Selection  (drag to toggle · right-click to label)")
         layout = QVBoxLayout(grp)
 
         tb = QHBoxLayout()
@@ -533,8 +534,13 @@ class ExperimentPanel(QWidget):
         self._well_placeholder.setStyleSheet("color: gray; font-size: 10px;")
         layout.addWidget(self._well_placeholder, stretch=1)
 
-        self.well_grid = WellGrid(rows=8, cols=12, mode=WellGrid.Mode.SELECT)
+        # Taller cells than the default so a sub-label fits on a second
+        # line under the well id without clipping.
+        self.well_grid = WellGrid(rows=8, cols=12, mode=WellGrid.Mode.SELECT,
+                                  cell_w=40, cell_h=28)
         self.well_grid.selection_changed.connect(self._update_sel_count)
+        self.well_grid.sub_labels_changed.connect(self._update_sel_count)
+        self.well_grid.sub_labels_changed.connect(self._autosave)
 
         self._well_scroll = QScrollArea()
         self._well_scroll.setWidgetResizable(True)
@@ -582,7 +588,11 @@ class ExperimentPanel(QWidget):
     def _update_sel_count(self):
         sel = self.well_grid.selected_count()
         tot = self.well_grid.total_count()
-        self.sel_count_lbl.setText(f"{sel} / {tot} selected")
+        txt = f"{sel} / {tot} selected"
+        labelled = self.well_grid.sub_labelled_count()
+        if labelled:
+            txt += f" · {labelled} labelled"
+        self.sel_count_lbl.setText(txt)
 
     def _update_resolution_label(self):
         pass  # placeholder for signal compatibility with MainWindow
@@ -665,6 +675,7 @@ class ExperimentPanel(QWidget):
             "loop_enabled": self.loop_enabled_chk.isChecked(),
             "loop_interval_s": self._loop_interval_seconds(),
             "loop_duration_s": self._loop_duration_seconds(),
+            "sub_labels": self.well_grid.get_sub_labels(),
         }
 
     def _apply_preset_data(self, data: dict):
@@ -691,6 +702,10 @@ class ExperimentPanel(QWidget):
         self._set_hms_seconds(self.loop_duration_h_spin, self.loop_duration_m_spin,
                                self.loop_duration_s_spin, float(data.get("loop_duration_s", 3600.0)))
         self._update_loop_visibility()
+        # Only touch sub-labels if the preset actually carries them, so
+        # loading an older preset doesn't wipe the current plate layout.
+        if "sub_labels" in data:
+            self.well_grid.set_sub_labels(data.get("sub_labels") or {})
         self._update_mode_visibility()
 
     def _refresh_presets(self):
@@ -759,6 +774,7 @@ class ExperimentPanel(QWidget):
         self._set_hms_seconds(self.loop_duration_h_spin, self.loop_duration_m_spin,
                                self.loop_duration_s_spin, float(s.get("loop_duration_s", 3600.0)))
         self._update_loop_visibility()
+        self.well_grid.set_sub_labels(s.get("sub_labels") or {})
 
     def _autosave(self, *_):
         self._save_session()
@@ -779,6 +795,7 @@ class ExperimentPanel(QWidget):
             "loop_enabled": self.loop_enabled_chk.isChecked(),
             "loop_interval_s": self._loop_interval_seconds(),
             "loop_duration_s": self._loop_duration_seconds(),
+            "sub_labels": self.well_grid.get_sub_labels(),
         })
 
     # ------------------------------------------------------------------
@@ -888,14 +905,32 @@ class ExperimentPanel(QWidget):
                 "Re-save it from the Calibration tab.")
             return
 
-        selected = self.well_grid.get_selected_indices()
-        if not selected:
+        selected_wells = self.well_grid.get_selected_labels()
+        if not selected_wells:
             logger.warning("Start Experiment blocked: no wells selected.")
             QMessageBox.critical(self, "Error", "No wells selected.")
             return
 
-        filtered_pos    = [positions[i] for i in selected if i < len(positions)]
-        filtered_labels = [labels[i]    for i in selected if i < len(labels)]
+        # Match the grid's selection to the calibration by *well id*, not by
+        # positional index.  The calibration stores wells in travel order,
+        # which for PATTERN_SNAKE reverses every other row — indexing into it
+        # with the grid's row-major indices addressed the mirrored well on
+        # odd rows.  Iterating the calibration in its own order also keeps
+        # the travel-path optimisation intact.
+        sub_labels = self.well_grid.get_sub_labels()
+        filtered_pos, filtered_labels = [], []
+        for i, well in enumerate(labels):
+            if well not in selected_wells or i >= len(positions):
+                continue
+            filtered_pos.append(positions[i])
+            filtered_labels.append(compose_well_label(well, sub_labels.get(well)))
+
+        if not filtered_pos:
+            msg = ("None of the selected wells exist in the calibration.\n"
+                   "Re-sync the well grid with the Calibration tab.")
+            logger.warning(f"Start Experiment blocked: {msg}")
+            QMessageBox.critical(self, "Error", msg)
+            return
 
         mode_map = {"Image": "image", "Raw Burst": "raw"}
         mode = mode_map.get(self.mode_combo.currentText(), "image")

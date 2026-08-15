@@ -91,6 +91,8 @@ Untested on real Marlin hardware — only exercised in simulate mode so far.
   - *Image*: format **PNG (default, as of PR #14)** / JPG / TIF, dwell per well. PNG was made the default for lossless, artifact-free output, with any speed tradeoff deferred to post-processing; the format combo box lists png first so a fresh install with no `session.json` yet also defaults to it.
   - *Raw Burst*: record duration. With "Use Laser": Pre-laser / Laser ON / Post-laser timing, captured continuously in one burst (**verified working on hardware**, including `laser_events` timing accuracy).
 - Well selection grid, with "Auto-process after experiment" checkbox to hand the finished folder straight to the Processing tab.
+- **Well sub-labels**: right-clicking the grid opens a context menu to attach a free-text suffix ("treated", "ctrl", ...) to the clicked well, or to the whole current selection when the click lands inside it. Labelled cells render as two lines (well id over suffix) with a per-label accent colour derived from a stable hash of the label text, so a mis-assigned well in an otherwise uniform block is visible at a glance. The suffix is folded into the well label handed to `ExperimentRunner.run()` (`A1` → `A1-treated`), which puts it into every capture filename, the CSV, and the metadata JSON for free. Persisted in experiment presets and `session.json` as `{well_id: sub_label}`. Sanitisation (`robocam/naming.py`) folds anything non-alphanumeric to `-`, never `_` — see § 4.
+- **Selection → calibration mapping fixed (2026-08-14)**: `_start_experiment()` used to index the calibration's `positions`/`labels` arrays with `WellGrid.get_selected_indices()`'s row-major flat indices. Calibration arrays are stored in *travel* order, and `PATTERN_SNAKE` reverses odd rows — so on a snake plate every odd row's grid cell addressed the mirrored well (grid "B1" → well B12). It now matches by well id via `WellGrid.get_selected_labels()` and iterates the calibration in its own order, which is both correct and preserves the snake travel-path optimisation. `get_selected_indices()` was removed outright (zero remaining callers) rather than left as a footgun. This was latent before sub-labels existed; with them it would have silently mislabelled treated/control wells.
 - **Auto-home**: if the printer reports not-homed when a run starts, `ExperimentRunner.run()` homes automatically before the well loop rather than blocking Start (PR #11, untested on real hardware).
 - **Experiment log**: scrolling box with verbose per-stage logging (homing, moving to well, dwelling, recording, laser on/off), plus a live "ETA: MM:SS" countdown computed right after homing from the motion profile's feed-rate/accel and exact dwell/capture durations — turns red and goes negative on overrun, shows "unavailable" on backends without a motion profile (Klipper). PR #14 tightened the underlying finalize- and capture-time estimates this depends on to within ~0.1% error on hardware (see § 3).
 - Start / Stop / Pause buttons. Status label updated on each state change.
@@ -130,6 +132,7 @@ Max-rate raw Bayer sensor data, all of a well's frames stacked into **one** memo
 Output layout:
 ```
 <exp_dir>/
+  experiment.json            ← run manifest (title, settings, well layout); see below
   raw/
     camera_meta.json
     A1_<ts>_stack.npy        ← one memory-mapped (n_frames, H, W) array for the whole well
@@ -174,6 +177,20 @@ Output:
 CLI: `python scripts/reconstruct_vfr.py <exp_dir/> [--codec ffv1] [--crf 18] [--mono] [--no-video] [--no-images]`
 
 GUI: Processing tab — verified working on hardware.
+
+---
+
+## 4b. Experiment Title & Well Sub-Label Persistence (`robocam/naming.py`, added 2026-08-14)
+
+The Experiment tab's name field used to reach disk only as the run directory name (`<ts>_<name>/`), so any file lifted out of that folder — the usual way videos get shared — lost all provenance. Titles now propagate three ways:
+
+1. **Run manifest** — `<exp_dir>/experiment.json`, written by `ExperimentRunner.run()` *before* the first well (so an interrupted run still leaves an identifiable folder) and rewritten at the end with `finished_at` / `completed` / `wells_captured`. Holds the raw title, the sanitized form, mode, all timing/laser settings, and the full well layout with each well's `label` / `well` / `sub_label` / XYZ. This is the run-level config snapshot the project previously had nowhere on disk. Write failures are logged, never raised — bookkeeping must not kill a capture.
+2. **Embedded in existing metadata** — `experiment_name` is stamped into `camera_meta.json` and every well's `*_metadata.json` (alongside `well_base` and `sub_label`), so a `raw/` directory moved on its own still knows its source.
+3. **Filenames + container tags** — still images become `<safe_name>_<well>_<ts>.<fmt>`; post-processed videos become `<safe_name>_<well>_<ts>.mp4` / `_vfr.mkv` and carry `title`/`comment`/`album`/`track`/`date` tags set on the PyAV output container before the first `mux()` (verified round-tripping through both the mov/mp4 and Matroska muxers). PNG/JPEG go through `cv2.imwrite`/`imencode`, which cannot write EXIF or tEXt, so each image folder gets a `_source.json` sidecar instead (also written into the `.zip` when zipped output is on).
+
+`postprocess.resolve_experiment_name(exp_dir)` recovers the title for a folder in that order — manifest → metadata → `camera_meta.json` → directory name with the leading `YYYYmmdd_HHMMSS_` stripped. The last fallback is what makes pre-existing captures still come out sensibly named. `process_well()` takes an optional `exp_name` override; the Processing tab resolves it once per folder, and `reconstruct_vfr.py` exposes it as `--name`.
+
+**Separator rule.** `parse_meta_name()` splits well filenames on `_` and takes `parts[0]` as the well, so a sub-label containing `_` would silently truncate the well name. `sanitize_sub_label()` therefore folds every non-alphanumeric character to `-`, giving `A1-treated_<ts>_metadata.json` → well `A1-treated`. Experiment names are sanitized more loosely (`sanitize_experiment_name()`, underscores allowed) since they only have to be filesystem-safe — but slashes/spaces are folded there too, which also closes a latent bug where a title containing `/` would have created a nested directory.
 
 ---
 

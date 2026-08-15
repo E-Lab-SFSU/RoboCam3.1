@@ -8,6 +8,27 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Added
+- **Experiment title persistence** — the Experiment tab's name used to reach
+  disk only as the run folder's name, so any video or image moved out of that
+  folder lost all provenance. The title is now written to a new run manifest
+  `<exp_dir>/experiment.json` (title, settings, full well layout, start/finish),
+  stamped into `camera_meta.json` and every well's `*_metadata.json`, prefixed
+  onto still-image and post-processed video filenames, and embedded as
+  `title`/`comment`/`album` tags inside the MP4 and MKV containers. Image
+  sequences (which can't carry EXIF through OpenCV) get a `_source.json`
+  sidecar per well folder. `postprocess.resolve_experiment_name()` recovers the
+  title from manifest → metadata → folder name, so captures made before this
+  existed still come out named; `reconstruct_vfr.py --name` overrides it.
+- **Well sub-labels** — right-click the well selection grid to attach a suffix
+  ("treated", "ctrl", ...) to a well, or to the whole selection when the click
+  lands inside it. The suffix becomes part of the well label everywhere
+  downstream (`A1-treated_<ts>_stack.npy`, `images_png/A1-treated/`,
+  `myexp_A1-treated_<ts>.mp4`) and is recorded separately as `sub_label` in the
+  metadata JSON. Labelled cells render the suffix under the well id in a
+  per-label accent colour so a mis-assigned well stands out. Saved with
+  experiment presets and the session. Sub-labels use `-`, never `_`, because
+  well filenames are parsed back apart on the underscore.
+
 - **Processing tab** — batch-convert `.npy` burst captures to PNG image
   sequences and video (MP4 + VFR MKV) with per-well progress. Auto-process
   checkbox in the Experiment tab triggers it automatically after each run.
@@ -91,6 +112,20 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   explicitly.
 
 ### Fixed
+- **Well selection mapped to the wrong wells on snake-pattern plates** —
+  `_start_experiment()` indexed the calibration's `positions`/`labels` arrays
+  with the grid's row-major flat indices, but calibrations are stored in travel
+  order and `PATTERN_SNAKE` reverses odd rows, so grid cell "B1" addressed well
+  B12. Selection is now matched by well id and the calibration is iterated in
+  its own order (which also preserves the snake travel-path optimisation).
+  Latent until now; with sub-labels it would have mislabelled treated/control
+  wells.
+- **Experiment names containing `/` or spaces** produced broken or nested
+  output paths — titles are now sanitised before use in any filesystem path,
+  with the unsanitised title preserved in the manifest and container tags.
+- `WellGrid` computed row letters as `chr(ord('A') + row)`, yielding `[` at row
+  26 where the calibration generator produces `AA` — both now share
+  `robocam.naming.row_label()`.
 - Experiment would silently jump to "finished" if `cv2` import was missing
   from `experiment.py` after the video mode cleanup.
 - **PlayerOne `bayer_pattern` was hardcoded to `"RGGB"`** regardless of the

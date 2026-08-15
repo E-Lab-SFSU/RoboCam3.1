@@ -171,15 +171,38 @@ Batch-converts one or more experiment folders' `.npy` bursts into independent PN
 
 ```
 outputs/20260625_133324_my_experiment/
+  experiment.json                             ← run manifest: title, settings, well layout + sub-labels, start/finish
   raw/
     camera_meta.json                          ← written once per experiment (backend, bit depth, bayer pattern, gain, exposure, fps, ...)
     A1_20260625_133324_stack.npy              ← one memory-mapped (n_frames, H, W) array for the whole well
     A1_20260625_133324_frames.jsonl           ← one JSON line per frame, appended as captured (crash-resilient sidecar)
     A1_20260625_133324_metadata.json          ← frames_file, per-frame timestamps, laser events, fps_average, duration_actual_s
-    A2_20260625_133324_metadata.json
+    A2-treated_20260625_133324_metadata.json  ← a well carrying a sub-label (see below)
     ...
   20260625_133324_my_experiment_points.csv   ← well positions and capture log
 ```
+
+### Experiment title and well sub-labels
+
+The **experiment name** from the Experiment tab is no longer only the folder
+name. It's written into `experiment.json`, into `camera_meta.json` and each
+well's `*_metadata.json`, prefixed onto still-image and post-processed video
+filenames, and embedded as a `title`/`comment` tag inside the MP4 and MKV
+containers — so a video that gets dragged out of its folder (or renamed) still
+says where it came from.
+
+**Sub-labels** attach a suffix to individual wells for grouping within one
+plate. Right-click the well grid to set one on the clicked well, or on the
+whole current selection if you right-click inside it. The suffix becomes part
+of the well label everywhere downstream — `A2-treated_<ts>_stack.npy`,
+`images_png/A2-treated/`, `myexp_A2-treated_<ts>.mp4` — and is recorded
+separately as `sub_label` in the metadata JSON so it can be read back without
+string-splitting. Sub-labels are saved with experiment presets and the session.
+
+Sub-labels use `-` rather than `_` as their separator on purpose: well
+filenames are parsed back apart on the underscore, so an underscore in a
+sub-label would truncate the well name. Any character that isn't alphanumeric
+is folded to `-` on entry (`robocam/naming.py`).
 
 (Pre-2026-07-06 captures used one `.npy` file per frame instead of a stacked array — `postprocess.py` still reads that older format too.)
 
@@ -188,19 +211,28 @@ After running the post-processing pipeline (Processing tab or `scripts/reconstru
 ```
   images_png/
     A1/
+      _source.json                      ← experiment title, well, sub-label, frame count
       A1_00000_000006ms_laser-off.png   ← debayered, clean (no overlay)
       A1_00152_005003ms_laser-on.png
       ...
-    A2/
+    A2-treated/
       ...
   images_jpeg/            ← only if JPEG output was selected
     ...
   videos_mp4/
-    A1_20260625_133324.mp4       ← constant-fps display (H.264 baseline, Pi-friendly)
+    my_experiment_A1_20260625_133324.mp4       ← constant-fps display (H.264 baseline, Pi-friendly)
   videos_vfr/
-    A1_20260625_133324_vfr.mkv   ← VFR archival (lossless ffv1 by default, accurate per-frame PTS)
-    A2_20260625_133324_vfr.mkv
+    my_experiment_A1_20260625_133324_vfr.mkv   ← VFR archival (lossless ffv1 by default, accurate per-frame PTS)
+    my_experiment_A2-treated_20260625_133324_vfr.mkv
 ```
+
+Video filenames are prefixed with the experiment title, and both containers
+carry `title` / `comment` / `album` tags naming the experiment, well and
+capture time. Image sequences can't hold EXIF (OpenCV writes them), so each
+well folder gets a `_source.json` sidecar instead. `reconstruct_vfr.py --name`
+overrides the title; with no flag it's recovered from `experiment.json`, then
+the metadata JSONs, then the folder name — so older captures still get a
+sensible title.
 
 Images/videos can optionally be packaged into one `.zip` per experiment per format (`images_png.zip`, `images_jpeg.zip`) instead of loose files, streamed directly into the archive.
 
