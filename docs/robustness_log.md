@@ -84,3 +84,32 @@ share `robocam.log`, and to confirm which file he edited for AstroDX.
 - Consider an explicit "verify firmware" step (e.g. send `M115` and check
   the response) rather than relying on the boot banner alone, since not
   every Marlin build prints one.
+
+### 2026-07-22 update
+
+Mark found two unrelated hardware faults on his own: the printer's PSU
+was set to 220V instead of 110V (likely the root cause of the earlier
+homing/connection flakiness — garbled logic-level behavior under the
+wrong mains setting would look a lot like a baud mismatch from the
+software side), and the touchscreen wasn't working because of a ribbon
+cable damaged in shipping (cosmetic — doesn't affect `send_gcode`/serial
+control, which doesn't go through the screen).
+
+After the PSU fix: homing now works. New symptom: Z axis moves very
+slowly during homing ("we can fix that" — flagged by Mark as a problem,
+but this is very likely just Marlin's normal, deliberately-conservative
+Z homing feedrate, not a defect). Camera is still not detected —
+this is the same open item from 2026-07-21, unresolved.
+
+**Still waiting on from Mark**: which file he edited to get AstroDX to
+see the Mars 662M, and a fresh `robocam.log` from a camera-detect attempt
+(now that logging is actually wired up). Suggested next steps sent back:
+run `python -m robocam camera info` directly to bypass the GUI dropdown
+and surface the real backend error; check `lsusb -d a0a0:` / `dmesg` after
+replugging to confirm the OS enumerates the device before RoboCam's SDK
+layer is involved; and send `M503` through the console (GUI G-code sender
+or `python -m robocam motion gcode "M503"`) to check Z's configured max
+feedrate/acceleration before assuming the homing speed needs changing.
+
+**Status**: Still open on the camera. Homing/connection side looks
+resolved by the PSU fix, pending Mark confirming it's stable.
