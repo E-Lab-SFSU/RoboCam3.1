@@ -522,10 +522,22 @@ class ExperimentPanel(QWidget):
         invert_btn = QPushButton("Invert")
         invert_btn.clicked.connect(lambda: self.well_grid.invert())
         tb.addWidget(invert_btn)
+        self.clear_labels_btn = QPushButton("Clear Labels")
+        self.clear_labels_btn.setToolTip(
+            "Remove every well sub-label on this plate.\n"
+            "Well selection is not affected."
+        )
+        self.clear_labels_btn.clicked.connect(self._clear_all_sub_labels)
+        tb.addWidget(self.clear_labels_btn)
+        tb.addStretch()
+        layout.addLayout(tb)
+
+        # On its own row: four buttons plus the counter don't fit the
+        # column's 380px minimum width, and a clipped QLabel doesn't elide.
         self.sel_count_lbl = QLabel("0 / 0 selected")
         self.sel_count_lbl.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-        tb.addWidget(self.sel_count_lbl)
-        layout.addLayout(tb)
+        self.sel_count_lbl.setStyleSheet("color: #555; font-size: 10px;")
+        layout.addWidget(self.sel_count_lbl)
 
         self._well_placeholder = QLabel(
             "Generate or load calibrated well map\nin the Calibration tab."
@@ -593,6 +605,32 @@ class ExperimentPanel(QWidget):
         if labelled:
             txt += f" · {labelled} labelled"
         self.sel_count_lbl.setText(txt)
+        # Enabled state tracks *all* stored labels, not just the visible
+        # count — labels on wells outside the current plate size are still
+        # saved and would still be cleared.
+        self.clear_labels_btn.setEnabled(bool(self.well_grid.get_sub_labels()))
+
+    def _clear_all_sub_labels(self):
+        """Reset every well sub-label on the plate (selection is untouched)."""
+        stored = self.well_grid.get_sub_labels()
+        if not stored:
+            return
+
+        visible = self.well_grid.sub_labelled_count()
+        detail = f"{len(stored)} well(s) are labelled"
+        if visible != len(stored):
+            detail += f" ({visible} on the current plate size)"
+
+        if QMessageBox.question(
+            self, "Clear Well Labels",
+            f"{detail}.\n\nRemove all of them? This can't be undone.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        ) != QMessageBox.StandardButton.Yes:
+            return
+
+        self.well_grid.clear_sub_labels()
+        logger.info(f"Cleared {len(stored)} well sub-label(s).")
 
     def _update_resolution_label(self):
         pass  # placeholder for signal compatibility with MainWindow

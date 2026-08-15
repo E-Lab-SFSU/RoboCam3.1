@@ -198,6 +198,9 @@ of the well label everywhere downstream — `A2-treated_<ts>_stack.npy`,
 `images_png/A2-treated/`, `myexp_A2-treated_<ts>.mp4` — and is recorded
 separately as `sub_label` in the metadata JSON so it can be read back without
 string-splitting. Sub-labels are saved with experiment presets and the session.
+A **Clear Labels** button next to Check All / Uncheck All / Invert resets every
+label on the plate (with a confirmation prompt); it leaves the well selection
+alone.
 
 Sub-labels use `-` rather than `_` as their separator on purpose: well
 filenames are parsed back apart on the underscore, so an underscore in a

@@ -27,7 +27,9 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   metadata JSON. Labelled cells render the suffix under the well id in a
   per-label accent colour so a mis-assigned well stands out. Saved with
   experiment presets and the session. Sub-labels use `-`, never `_`, because
-  well filenames are parsed back apart on the underscore.
+  well filenames are parsed back apart on the underscore. A **Clear Labels**
+  button alongside Check All / Uncheck All / Invert resets every label on the
+  plate after a confirmation prompt, without touching the well selection.
 
 - **Processing tab** — batch-convert `.npy` burst captures to PNG image
   sequences and video (MP4 + VFR MKV) with per-well progress. Auto-process

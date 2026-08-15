@@ -78,6 +78,28 @@ class TestSubLabelState:
         grid.clear_sub_labels()
         assert grid.get_sub_labels() == {}
 
+    def test_clear_removes_dormant_labels_too(self, grid):
+        """"Clear Labels" means everything stored, not just what's on screen."""
+        grid.set_sub_labels({"A1": "treated", "Z99": "offgrid"})
+        grid.clear_sub_labels()
+        assert grid.get_sub_labels() == {}
+
+    def test_clear_leaves_selection_alone(self, grid):
+        _select_only(grid, {"A1", "A2"})
+        grid.set_sub_labels({"A1": "treated"})
+        grid.clear_sub_labels()
+        assert grid.get_selected_labels() == {"A1", "A2"}
+
+    def test_clear_emits_only_when_something_changed(self, grid):
+        seen = []
+        grid.sub_labels_changed.connect(lambda: seen.append(1))
+        grid.clear_sub_labels()
+        assert not seen                      # nothing to clear -> no signal
+        grid.set_sub_labels({"A1": "treated"})
+        seen.clear()
+        grid.clear_sub_labels()
+        assert seen
+
     def test_emits_signal(self, grid):
         seen = []
         grid.sub_labels_changed.connect(lambda: seen.append(1))
