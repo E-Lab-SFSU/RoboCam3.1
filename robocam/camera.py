@@ -122,6 +122,14 @@ class Camera:
         self._device_index = device_index
         self._po_frame_buf: Optional[np.ndarray] = None
 
+        # Last-known exposure in microseconds, kept in sync by get_exposure()/
+        # set_exposure(). get_frame() needs the exposure to size its _sdk_lock
+        # timeout, and it has to know it *before* taking the lock — calling
+        # get_exposure() there would take the lock itself, which both deadlocks
+        # (threading.Lock is not reentrant) and adds to the contention it is
+        # trying to survive. Seeded with the SDK default until the first read.
+        self._exposure_us_cached: int = 20000
+
         # Software pacing target for raw-burst capture, independent of
         # exposure — see set_target_fps(). None means "capture as fast as
         # exposure allows" (the historical, still-default behaviour).
@@ -303,6 +311,7 @@ class Camera:
             return 20000
         with self._sdk_lock:
             _, val, _ = self._poa.GetConfig(self._camera_id, self._poa.POAConfig.POA_EXPOSURE)
+            self._exposure_us_cached = int(val)
             return int(val)
 
     def set_exposure(self, us: int) -> None:
@@ -316,6 +325,7 @@ class Camera:
             return
         with self._sdk_lock:
             val = int(round(float(us)))
+            self._exposure_us_cached = val
             self._poa.SetExp(self._camera_id, val, False)
 
     def get_target_fps(self) -> Optional[float]:
@@ -491,30 +501,49 @@ class Camera:
             self._poa.StartExposure(self._camera_id, False)
             logger.info(f"Resolution changed to {w}x{h}")
 
-    def get_frame(self) -> Optional[np.ndarray]:
-        """Returns a BGR image frame for display or saving."""
+    def get_frame(self, timeout_s: Optional[float] = None) -> Optional[np.ndarray]:
+        """Returns a BGR image frame for display or saving.
+
+        timeout_s bounds how long we are willing to wait for _sdk_lock. The
+        default scales with exposure and suits the live-preview threads, which
+        would rather drop a frame than queue. A deliberate one-shot capture
+        should pass something generous — see CalibrationPanel._quick_capture_image().
+        """
         if self.simulate or not self.running:
             return np.zeros((self.resolution[1], self.resolution[0], 3), dtype=np.uint8)
             
         if self.backend == "playerone":
-            if not self._sdk_lock.acquire(timeout=0.05):
+            # Both timeouts below have to exceed the exposure, and neither used
+            # to. Every tab builds its own _FrameGrabber (calibration_panel.py,
+            # experiment_panel.py, manual_control_panel.py) and all three poll
+            # this method at 15 fps for the life of the process — set_paused()
+            # exists but is never called — so _sdk_lock sees ~45 acquisitions/s
+            # against a camera that can serve ~15 at a 66 ms exposure. Each
+            # holder keeps the lock for roughly a whole exposure, so a caller
+            # willing to wait only 50 ms lost the race almost every time: at the
+            # 66 ms exposure darkfield needs, Quick Capture failed ~9 clicks in
+            # 10. The old flat 100 ms ImageReady() deadline was wrong for the
+            # same reason, and outright unusable above ~100 ms when the UI
+            # allows exposures up to 2000 ms. get_raw_frame() already derives
+            # its timeout from the exposure; this is that fix, backported.
+            exposure_ms = max(1, int(self._exposure_us_cached) // 1000)
+            if timeout_s is None:
+                timeout_s = min(3.0, (exposure_ms * 3 + 200) / 1000.0)
+            if not self._sdk_lock.acquire(timeout=timeout_s):
                 return None
             try:
                 poa = self._poa
                 cid = self._camera_id
-                
-                deadline = time.monotonic() + 0.1
-                while time.monotonic() < deadline:
-                    err, ready = poa.ImageReady(cid)
-                    if err == poa.POAErrors.POA_OK and ready:
-                        break
-                    time.sleep(0.005)
-                else:
-                    return None
-                    
+
                 w, h = self.resolution
                 buf = np.zeros(w * h, dtype=np.uint8)
-                err = poa.GetImageData(cid, buf, 500)
+                # Direct blocking fetch, as in get_raw_frame(): GetImageData()
+                # blocks internally until a frame is ready or the timeout
+                # elapses, which makes the old manual ImageReady() poll loop
+                # redundant as well as too short. Bounded so a stalled camera
+                # still returns control to the caller.
+                timeout_ms = min(2500, max(20, exposure_ms + 100))
+                err = poa.GetImageData(cid, buf, timeout_ms)
                 if err != poa.POAErrors.POA_OK:
                     return None
                     

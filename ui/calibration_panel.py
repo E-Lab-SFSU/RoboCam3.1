@@ -1165,11 +1165,21 @@ class CalibrationPanel(QWidget):
         fmt = self.qc_fmt_combo.currentText()
         out_dir = Path("outputs") / "quick_capture"
         out_dir.mkdir(parents=True, exist_ok=True)
-        ts = time.strftime("%Y%m%d_%H%M%S")
+        # Millisecond resolution: %H%M%S alone silently overwrote a previous
+        # capture whenever two clicks landed inside the same second.
+        ts = time.strftime("%Y%m%d_%H%M%S") + f"_{int(time.time() * 1000) % 1000:03d}"
         path = out_dir / f"quick_{ts}.{fmt}"
-        frame = cam.get_frame()
+        # Wait properly for the lock. This is a deliberate one-shot the user
+        # is standing there waiting for, so it should queue behind the preview
+        # threads rather than fail fast the way they do — see Camera.get_frame().
+        frame = cam.get_frame(timeout_s=5.0)
         if frame is None:
-            QMessageBox.warning(self, "Error", "Could not read a frame.")
+            QMessageBox.warning(
+                self, "Error",
+                "Could not read a frame within 5 s.\n\n"
+                "The camera is likely saturated by the live previews. Try again, "
+                "or use Record Video, which uses the raw-burst capture path.",
+            )
             return
         if cam.backend == "picamera2":
             frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
